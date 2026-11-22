@@ -114,6 +114,17 @@ pub const CONTRACT: &[Var] = &[
     ),
     op(
         "Network and files",
+        "OCSERVE_WORKING_DIR",
+        "your home directory",
+        "dir[:dir...] (empty = none)",
+        "Directories that clients may read project files from, besides the server's \
+         own working directory. A client names its project with `x-opencode-directory` \
+         or `location[directory]`; anything outside the working directory and these \
+         directories is refused. Unset, your home directory is used; set it (even to \
+         empty) to replace that.",
+    ),
+    op(
+        "Network and files",
         "OCSERVE_DATA_DIR",
         "~/.local/share/ocserve",
         "a directory",

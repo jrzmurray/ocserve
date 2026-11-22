@@ -22,6 +22,7 @@ for the normal behaviour.
 | `OCSERVE_PORT` | 4096 | 1-65535 | Listen port. Precedence: --port, then ocserve.toml, then this, then 4096. |
 | `OCSERVE_HOSTNAME` | 127.0.0.1 | an address | Bind address. Precedence: --hostname, then ocserve.toml, then this. |
 | `OCSERVE_HOME` | HOME, then USERPROFILE | a directory | Overrides the home directory used for config/cache lookups (harnesses set it). |
+| `OCSERVE_WORKING_DIR` | your home directory | dir[:dir...] (empty = none) | Directories that clients may read project files from, besides the server's own working directory. A client names its project with `x-opencode-directory` or `location[directory]`; anything outside the working directory and these directories is refused. Unset, your home directory is used; set it (even to empty) to replace that. |
 | `OCSERVE_DATA_DIR` | ~/.local/share/ocserve | a directory | State directory: database, blobs, plugin host, snapshots. |
 | `OCSERVE_CONFIG_WRITE` | shared | shared \| overlay | Where PATCH /config writes. `overlay` keeps ocserve out of the opencode config. |
 | `OCSERVE_CORS` | (none) | origin[,origin...] | Extra allowed CORS origins, comma-separated. |

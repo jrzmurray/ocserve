@@ -703,26 +703,97 @@ fn verify_parent(base: &std::path::Path, rel: &str) -> std::io::Result<std::path
         }
     }
 }
+/// Largest file `GET /api/fs/read` will return (64 MiB).
+const FS_READ_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const FS_READ_TOO_LARGE: &str = "file exceeds the read limit";
+
+/// Roots a request-supplied directory scope may live under: the server's
+/// working directory, plus `OCSERVE_WORKING_DIR` (path-separator list) or, when
+/// that is unset, the server home. Each is canonicalised; one that does not
+/// resolve is dropped, so a misconfigured root fails closed.
+pub(crate) fn allowed_scope_roots(st: &AppState) -> Vec<std::path::PathBuf> {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(d) = st.paths["directory"].as_str() {
+        roots.push(d.into());
+    }
+    match std::env::var_os("OCSERVE_WORKING_DIR") {
+        Some(list) => roots.extend(std::env::split_paths(&list).filter(|p| p.is_absolute())),
+        None => {
+            if let Some(h) = st.paths["home"].as_str() {
+                roots.push(h.into());
+            }
+        }
+    }
+    roots
+        .into_iter()
+        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .collect()
+}
+
+/// Resolve a request-supplied scope directory to its verified real path, or
+/// refuse it. Uses the same handle-based `open_within` as every file route, so
+/// `..`, symlinks and missing directories cannot widen the scope.
+pub(crate) fn contain_scope_dir(
+    roots: &[std::path::PathBuf],
+    dir: &str,
+) -> Result<std::path::PathBuf, crate::containment::OpenError> {
+    use crate::containment::{OpenError, OpenKind, open_within};
+    if dir.len() > 4096 || !dir.starts_with('/') || dir == "/" {
+        return Err(OpenError::Escape);
+    }
+    for root in roots {
+        if let Ok(c) = open_within(root, dir, OpenKind::Dir) {
+            return Ok(c.path().to_path_buf());
+        }
+    }
+    // One answer for every refusal (missing, outside the roots, not a
+    // directory, unreadable), so the route is not a directory-existence oracle.
+    Err(OpenError::Escape)
+}
+
 /// GET /api/fs/read/*path — raw bytes of one file (Uint8Array on the wire).
 pub async fn fs_read(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
     Path(path): Path<String>,
 ) -> Result<axum::response::Response, ApiError> {
     // Same containment rule as every other fs route (containment.rs), and the
     // bytes are read from the verified handle rather than by re-resolving the
     // path. This replaced a third copy of canonicalize+starts_with that the
     // handle-based guard (rule 43) found on its first run.
-    let base = std::path::Path::new(st.paths["directory"].as_str().unwrap_or("/")).to_path_buf();
+    // The base is the REQUEST's directory (`scoped_directory`), not the server
+    // cwd; `open_within` still refuses anything that escapes it.
+    let requested = scoped_directory(&st, &headers, &q, None);
+    let roots = allowed_scope_roots(&st);
+    let default_dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
     let raw = path.trim_start_matches('/').to_string();
     let read =
         tokio::task::spawn_blocking(move || -> Result<Vec<u8>, crate::containment::OpenError> {
             use std::io::Read;
+            // The request-supplied base is itself untrusted: it must exist and
+            // resolve beneath the server cwd or home before anything is read
+            // from it.
+            // The server's own default directory is trusted as before; only a
+            // caller-supplied scope is contained.
+            let base = if requested == default_dir {
+                std::path::PathBuf::from(&requested)
+            } else {
+                contain_scope_dir(&roots, &requested)?
+            };
             let c =
                 crate::containment::open_within(&base, &raw, crate::containment::OpenKind::File)?;
-            let mut f = c.into_file();
+            // Bound the read so one request cannot exhaust memory.
             let mut buf = Vec::new();
-            f.read_to_end(&mut buf)
+            c.into_file()
+                .take(FS_READ_MAX_BYTES + 1)
+                .read_to_end(&mut buf)
                 .map_err(crate::containment::OpenError::Io)?;
+            if buf.len() as u64 > FS_READ_MAX_BYTES {
+                return Err(crate::containment::OpenError::Invalid(
+                    FS_READ_TOO_LARGE.into(),
+                ));
+            }
             Ok(buf)
         })
         .await
@@ -734,6 +805,13 @@ pub async fn fs_read(
                 status: StatusCode::BAD_REQUEST,
                 name: "BadRequest",
                 message: "path escapes the project directory".into(),
+            });
+        }
+        Err(crate::containment::OpenError::Invalid(m)) if m == FS_READ_TOO_LARGE => {
+            return Err(ApiError {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                name: "BadRequest",
+                message: m,
             });
         }
         Err(e) => {

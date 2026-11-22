@@ -7,6 +7,15 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 ## Unreleased
 
 ### Fixed
+- `GET /api/fs/read/*path` now reads from the directory the request names
+  (`location[directory]`, `directory`, or `x-opencode-directory`) instead of the
+  server's working directory. Path-escape protection is unchanged, and the
+  requested directory must exist and lie beneath the server working directory
+  or home (otherwise 400); `OCSERVE_WORKING_DIR` replaces home as the extra root.
+  Reads are capped at 64 MiB. A client that
+  reads a project file through a server started elsewhere, such as the remote
+  task dispatcher's `.opencode-dispatch.json` lookup, previously got a 404. The
+  other `/api/fs/*` routes are still unscoped (issue #67).
 - `POST`, `DELETE` and `GET /api/worktree` now act on the project the request
   names instead of the server's working directory. Previously a server started
   outside a git repository answered `WorktreeNotGitError` for every project,

@@ -233,7 +233,9 @@ pub fn open_within(base: &Path, raw: &str, kind: OpenKind) -> Result<Contained, 
             let mut mode = Mode::empty();
             match kind {
                 OpenKind::Dir => flags |= OFlags::DIRECTORY | OFlags::RDONLY,
-                OpenKind::File => flags |= OFlags::RDONLY,
+                // NONBLOCK: opening a FIFO or device node must not hang the
+                // worker; non-regular files are rejected after the open.
+                OpenKind::File => flags |= OFlags::RDONLY | OFlags::NONBLOCK,
                 OpenKind::Create => {
                     flags |= OFlags::CREATE | OFlags::WRONLY | OFlags::TRUNC;
                     mode = Mode::from_bits_truncate(0o666);
@@ -243,6 +245,7 @@ pub fn open_within(base: &Path, raw: &str, kind: OpenKind) -> Result<Contained, 
             match openat2(&dirfd, rel, flags, mode, resolve) {
                 Ok(fd) => {
                     let file = std::fs::File::from(fd);
+                    require_regular(kind, &file)?;
                     let real = real_path_of(&file)?;
                     return Ok(Contained { file, real });
                 }
@@ -257,8 +260,8 @@ pub fn open_within(base: &Path, raw: &str, kind: OpenKind) -> Result<Contained, 
 
     // Portable path: open first, then verify the handle.
     let file = match kind {
-        OpenKind::Dir => std::fs::File::open(&target)?,
-        OpenKind::File => std::fs::File::open(&target)?,
+        OpenKind::Dir => open_read(&target, true)?,
+        OpenKind::File => open_read(&target, false)?,
         OpenKind::Create => {
             // Refuse to follow a symlink at the final component: writing
             // through one is the F6 escape class.
@@ -284,7 +287,42 @@ pub fn open_within(base: &Path, raw: &str, kind: OpenKind) -> Result<Contained, 
     if !is_beneath(&real, &canon_base) {
         return Err(OpenError::Escape);
     }
+    require_regular(kind, &file)?;
     Ok(Contained { file, real })
+}
+
+/// Open for reading without ever blocking on a FIFO or device node
+/// (`O_NONBLOCK`), and, for a directory, only if it is one (`O_DIRECTORY`).
+fn open_read(target: &Path, dir: bool) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut flags = libc::O_NONBLOCK;
+        if dir {
+            flags |= libc::O_DIRECTORY;
+        }
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags)
+            .open(target)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        std::fs::File::open(target)
+    }
+}
+
+/// A `File` open must yield a regular file: a FIFO, socket or device would
+/// otherwise be read (and could block or stream without end).
+fn require_regular(kind: OpenKind, file: &std::fs::File) -> Result<(), OpenError> {
+    if kind == OpenKind::File && !file.metadata()?.is_file() {
+        return Err(OpenError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        )));
+    }
+    Ok(())
 }
 
 /// Create (or truncate) `raw` beneath `base`, creating missing parents, with
