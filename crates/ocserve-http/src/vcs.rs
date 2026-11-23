@@ -38,6 +38,21 @@ fn run_git(dir: &str, args: &[&str]) -> Option<(String, i32)> {
     Some((text, out.status.code().unwrap_or(-1)))
 }
 
+/// Like [`run_git`] but keeps stderr, for commands whose failure text the
+/// caller reports (git writes its refusals to stderr, stdout is empty).
+fn run_git_diag(dir: &str, args: &[&str]) -> Option<(String, i32)> {
+    let out = ocserve_store::cgroup::command("git", "tools")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .ok()?;
+    let mut text = String::from_utf8_lossy(&out.stderr).into_owned();
+    if text.trim().is_empty() {
+        text = String::from_utf8_lossy(&out.stdout).into_owned();
+    }
+    Some((text, out.status.code().unwrap_or(-1)))
+}
+
 /// `git status --porcelain=v1 -z --untracked-files=all --no-renames`.
 /// Returns (file, code2) where code2 is the two-char XY.
 fn status_entries(dir: &str) -> Vec<(String, String)> {
@@ -287,15 +302,39 @@ pub fn worktree_add(dir: &str, path: &str, branch: Option<&str>) -> Result<Strin
         return Err("invalid branch name".to_string());
     }
     let mut args = vec!["worktree", "add"];
-    if branch.is_some() {
-        args.push("--detach");
-    }
-    args.push("--");
-    args.push(path);
     if let Some(b) = branch {
-        args.push(b);
+        // `branch` names a ref that exists (check it out detached, as before)
+        // or a branch to create at HEAD. Clients such as the remote task
+        // dispatcher send a fresh `ai/agent/<id>` name and expect the server
+        // to create it; treating it as an existing ref made git fail with
+        // `invalid reference`.
+        let verify = format!("{b}^{{commit}}");
+        let exists = matches!(
+            run_git(dir, &["rev-parse", "--verify", "--quiet", &verify]),
+            Some((_, 0))
+        );
+        if exists {
+            args.push("--detach");
+        } else {
+            if !matches!(
+                run_git(dir, &["check-ref-format", "--branch", b]),
+                Some((_, 0))
+            ) {
+                return Err(format!("invalid branch name: {b}"));
+            }
+            args.push("-b");
+            args.push(b);
+        }
+        args.push("--");
+        args.push(path);
+        if exists {
+            args.push(b);
+        }
+    } else {
+        args.push("--");
+        args.push(path);
     }
-    match run_git(dir, &args) {
+    match run_git_diag(dir, &args) {
         Some((_, 0)) => Ok(path.to_string()),
         Some((t, _)) => Err(t.trim().to_string()),
         None => Err("git failed to spawn".to_string()),
@@ -313,7 +352,7 @@ pub fn worktree_remove(dir: &str, path: &str, force: bool) -> Result<(), String>
     }
     args.push("--");
     args.push(path);
-    match run_git(dir, &args) {
+    match run_git_diag(dir, &args) {
         Some((_, 0)) => Ok(()),
         Some((t, _)) => Err(t.trim().to_string()),
         None => Err("git failed to spawn".to_string()),

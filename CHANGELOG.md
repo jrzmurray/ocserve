@@ -7,6 +7,12 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 ## Unreleased
 
 ### Fixed
+- `POST /api/worktree` now creates the branch named by `branch` when it is not
+  an existing ref, and checks an existing ref out detached as before. The
+  remote task dispatcher sends a fresh `ai/agent/<id>` name; treating it as an
+  existing ref made git fail with `invalid reference`. Git's own message
+  (stderr) is now returned on failure instead of an empty string, for create
+  and remove. A malformed branch name is refused with `invalid branch name`.
 - `POST`, `DELETE` and `GET /api/worktree` now act on the project the request
   names instead of the server's working directory. Previously a server started
   outside a git repository answered `WorktreeNotGitError` for every project,

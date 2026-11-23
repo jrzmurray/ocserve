@@ -290,3 +290,114 @@ async fn a_dash_prefixed_branch_is_refused_not_parsed_as_a_git_option() {
     assert_eq!(st, StatusCode::BAD_REQUEST, "body {v}");
     assert!(!scratch.path().join("wt").exists());
 }
+
+#[tokio::test]
+async fn an_unknown_branch_name_is_created_not_treated_as_a_ref() {
+    // The remote task dispatcher sends a fresh `ai/agent/<id>` name and expects
+    // the server to create it. Treated as an existing ref, git failed with
+    // "invalid reference" and the client saw an empty message.
+    let project = repo();
+    let scratch = tempfile::tempdir().unwrap();
+    let target = scratch.path().join("wt");
+    let (st, v) = call(
+        &app(),
+        "POST",
+        "/api/worktree",
+        &[],
+        Some(json!({
+            "projectID": project.path().to_str().unwrap(),
+            "from": project.path().to_str().unwrap(),
+            "directory": target.to_str().unwrap(),
+            "branch": "ai/agent/agent-1234",
+            "name": "agent-1234",
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "body {v}");
+    assert_eq!(
+        git(&target, &["branch", "--show-current"]),
+        "ai/agent/agent-1234",
+        "the worktree must be on the newly created branch"
+    );
+    assert_eq!(
+        git(project.path(), &["rev-parse", "ai/agent/agent-1234"]),
+        git(project.path(), &["rev-parse", "HEAD"]),
+        "the new branch starts at the project's HEAD"
+    );
+}
+
+#[tokio::test]
+async fn an_existing_branch_is_still_checked_out_detached() {
+    let project = repo();
+    git(project.path(), &["branch", "feature"]);
+    let scratch = tempfile::tempdir().unwrap();
+    let target = scratch.path().join("wt");
+    let (st, v) = call(
+        &app(),
+        "POST",
+        "/api/worktree",
+        &[],
+        Some(json!({
+            "projectID": project.path().to_str().unwrap(),
+            "directory": target.to_str().unwrap(),
+            "branch": "feature",
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "body {v}");
+    assert_eq!(
+        git(&target, &["branch", "--show-current"]),
+        "",
+        "an existing ref is checked out detached, so the branch stays free"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_branch_name_is_refused_with_a_message() {
+    let project = repo();
+    let scratch = tempfile::tempdir().unwrap();
+    let (st, v) = call(
+        &app(),
+        "POST",
+        "/api/worktree",
+        &[],
+        Some(json!({
+            "projectID": project.path().to_str().unwrap(),
+            "directory": scratch.path().join("wt").to_str().unwrap(),
+            "branch": "bad..name",
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "body {v}");
+    assert!(
+        v.to_string().contains("invalid branch name"),
+        "the refusal must say why: {v}"
+    );
+}
+
+#[tokio::test]
+async fn a_git_failure_reports_gits_own_message() {
+    // git writes its refusals to stderr; the response used to be empty.
+    let project = repo();
+    let scratch = tempfile::tempdir().unwrap();
+    let target = scratch.path().join("wt");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("occupied"), "x").unwrap();
+    let (st, v) = call(
+        &app(),
+        "POST",
+        "/api/worktree",
+        &[],
+        Some(json!({
+            "projectID": project.path().to_str().unwrap(),
+            "directory": target.to_str().unwrap(),
+            "branch": "ai/agent/occupied",
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "body {v}");
+    assert!(
+        v.to_string().contains("already exists"),
+        "git's message must reach the client: {v}"
+    );
+}
