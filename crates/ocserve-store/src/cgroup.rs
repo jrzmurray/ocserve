@@ -78,7 +78,7 @@ pub fn leaf_policy(name: &str) -> LeafPolicy {
 ///
 /// `echo 500 > oom_score_adj` makes a memcg kill prefer this child over the
 /// server (200). The cgroup move is a no-op when no leaf was published
-/// (bare/foreground runs, non-systemd, Windows without a POSIX shell).
+/// (bare/foreground runs, non-systemd, or non-Linux platforms).
 /// The two `unset` lines matter (2026-10-21): `INVOCATION_ID` is inherited by
 /// every descendant, and a tool that runs `ocserve serve` inherited it too,
 /// so the nested server believed it was the unit's main process and ran the
@@ -112,10 +112,11 @@ pub fn leaf(name: &str) -> Option<PathBuf> {
     p.is_dir().then_some(p)
 }
 
-/// Whether a POSIX shell exists to run [`WRAPPER`]. Windows uses Job Objects
-/// and never takes this path.
+/// Whether Linux cgroup controls and a POSIX shell are available for
+/// [`WRAPPER`]. Darwin has a POSIX shell, but no `/proc` or cgroup v2, so the
+/// wrapper's `oom_score_adj` write would print an error into tool output.
 pub fn wrapper_usable() -> bool {
-    cfg!(unix) && crate::platform::has_posix_shell()
+    cfg!(target_os = "linux") && crate::platform::has_posix_shell()
 }
 
 /// The shape of a contained spawn, runtime-agnostic.
@@ -200,6 +201,15 @@ mod tests {
     }
 
     #[test]
+    fn cgroup_wrapper_is_linux_only() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(wrapper_usable(), crate::platform::has_posix_shell());
+
+        #[cfg(not(target_os = "linux"))]
+        assert!(!wrapper_usable(), "Linux cgroup wrapper used off Linux");
+    }
+
+    #[test]
     fn leaf_names_are_the_closed_set() {
         assert_eq!(LEAVES, ["plugin", "mcp", "tools", "pty"]);
     }
@@ -212,7 +222,13 @@ mod tests {
             assert!(leaf("tools").is_none());
             let shape = contained("true", "tools");
             assert!(shape.cgroup.is_none(), "no leaf on uncontained spawn");
-            assert_eq!(shape.program, "sh", "wrapped even when uncontained");
+            #[cfg(target_os = "linux")]
+            assert_eq!(
+                shape.program, "sh",
+                "Linux wrapper stays active uncontained"
+            );
+            #[cfg(not(target_os = "linux"))]
+            assert_eq!(shape.program, "true", "Linux wrapper is unavailable here");
         }
     }
 

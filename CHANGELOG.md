@@ -7,6 +7,9 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 ## Unreleased
 
 ### Fixed
+- On macOS the contained-spawn shell wrapper wrote to `/proc/self/oom_score_adj`
+  and appended `No such file or directory` to every bash tool result. The
+  wrapper is now used on Linux only (`K-CONTAIN`).
 - A v2 turn now closes the way upstream does, so a loop-guard ask or a dead
   process cannot leave a session looking busy. `session.execution.*` frames
   carry `sessionID` inside `data` (v2 clients filter on it and dropped the
