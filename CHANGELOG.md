@@ -56,6 +56,12 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
   running `create_dir_all` on the raw string first (`K-CONTAINMENT`).
   Absolute targets outside the base, or containing `..`, are now refused as
   an escape before anything is created.
+- The kids/ memory budget follows the service's own limit instead of a fixed
+  700 MiB: unset `OCSERVE_KIDS_MEMORY_MAX_MB` gives 3/4 of the unit's
+  `MemoryMax` (1/2 host memory when uncapped), and the tools leaf takes what the
+  small classes leave. Raising the unit's `MemoryMax` now raises the budget.
+- A git worktree command that is killed (SIGKILL from the cgroup OOM killer)
+  reports the signal and git's stderr. Before, it returned an empty error.
 - A v2 turn now closes the way upstream does, so a loop-guard ask or a dead
   process cannot leave a session looking busy. `session.execution.*` frames
   carry `sessionID` inside `data` (v2 clients filter on it and dropped the

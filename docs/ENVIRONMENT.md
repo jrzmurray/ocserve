@@ -82,7 +82,7 @@ for the normal behaviour.
 | `OCSERVE_DRAIN_CANCEL_SECS` | 30 | seconds (0 = unbounded) | How long DELETE waits for a cancelled v2 drain to confirm before proceeding with teardown. 0 restores the old unbounded wait, which can hold a deletion fence for the provider stall budget. |
 | `OCSERVE_CGROUP_PARTITION` | auto (only under systemd) | 0 \| 1 \| unset | Kids/ cgroup partition for child processes. |
 | `OCSERVE_KIDS_CGROUP` | (internal) | a cgroup directory | Set by the partition dance for child processes; do not set it yourself. |
-| `OCSERVE_KIDS_MEMORY_MAX_MB` | 700 | 32-1048576 | Aggregate memory cap for the kids/ cgroup. |
+| `OCSERVE_KIDS_MEMORY_MAX_MB` | derived | 32-1048576 | Aggregate memory cap for the kids/ cgroup. Unset: 3/4 of the service's own `MemoryMax` (or 1/2 host memory when uncapped). Tools takes the remainder. |
 | `OCSERVE_SIDECAR_RECYCLE_MB` | 280 | MB; 0 disables | Plugin-host RSS that triggers a graceful restart of the host. |
 | `OCSERVE_DRAIN_SECS` | 20 | seconds; 0 = forever | Shutdown drain deadline. |
 

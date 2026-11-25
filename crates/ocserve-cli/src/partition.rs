@@ -112,6 +112,21 @@ fn cgroup_rel() -> Option<String> {
     )
 }
 
+/// The service's own `memory.max` in MiB; None when unlimited (`max`) or unreadable.
+fn unit_memory_max_mb(root: &Path) -> Option<u64> {
+    let raw = std::fs::read_to_string(root.join("memory.max")).ok()?;
+    let bytes: u64 = raw.trim().parse().ok()?;
+    Some(bytes / (1024 * 1024))
+}
+
+/// Host MemTotal in MiB, from /proc/meminfo.
+fn host_memory_total_mb() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = text.lines().find(|l| l.starts_with("MemTotal:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb / 1024)
+}
+
 /// Pure gate (tested): `OCSERVE_CGROUP_PARTITION=0` kills, `=1` forces,
 /// unset/other → only as a systemd unit's MAIN process, at its cgroup root.
 ///
@@ -237,22 +252,28 @@ pub fn setup_in(root: &Path, disabled: bool) -> Partition {
         tracing::warn!("partition: enable controllers failed: {e}");
         return Partition::Unavailable("enable-memory");
     }
-    let mb: u64 = std::env::var("OCSERVE_KIDS_MEMORY_MAX_MB")
+    // The kids budget follows the service's own limit (see kids_budget_mb), so
+    // raising the unit's MemoryMax raises the children's budget with it.
+    let env_mb: Option<u64> = std::env::var("OCSERVE_KIDS_MEMORY_MAX_MB")
         .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|v| (32..=1_048_576).contains(v))
-        .unwrap_or(700);
+        .and_then(|v| v.parse().ok());
+    let (mb, source) = ocserve_store::cgroup::kids_budget_mb(
+        env_mb,
+        unit_memory_max_mb(root),
+        host_memory_total_mb(),
+    );
+    tracing::info!("partition: kids budget {mb} MiB ({source})");
     let max_path = root.join("kids/memory.max");
     if let Err(e) = std::fs::write(&max_path, (mb * 1024 * 1024).to_string()) {
         tracing::warn!("partition: kids memory.max failed: {e}");
         return Partition::Unavailable("kids-cap");
     }
     let mut leaf_failures = 0u32;
-    // Soft ceiling on the aggregate: throttle the class at 640M instead of
-    // letting it run into the 700M hard cap and die as a unit.
+    // Soft ceiling on the aggregate: throttle at 7/8 of the budget instead of
+    // letting the class run into the hard cap and die as a unit.
     if std::fs::write(
         root.join("kids/memory.high"),
-        (640u64 * 1024 * 1024).to_string(),
+        (mb * 7 / 8 * 1024 * 1024).to_string(),
     )
     .is_err()
     {
@@ -302,10 +323,10 @@ pub fn setup_in(root: &Path, disabled: bool) -> Partition {
                 }
             }
             // Per-class memory: without this every leaf inherited `max` and a
-            // single build could starve the plugin host out of the shared
-            // 700M pot (2026-10-23 review). `high < max` so the class is
-            // throttled before it is killed.
-            let policy = ocserve_store::cgroup::leaf_policy(name);
+            // single build could starve the plugin host out of the shared kids
+            // pot (2026-10-23 review). `high < max` so the class is throttled
+            // before it is killed. Tools scales with the budget.
+            let policy = ocserve_store::cgroup::leaf_policy_for(name, mb);
             for (file, value) in [
                 ("memory.high", (policy.high_mb * 1024 * 1024).to_string()),
                 ("memory.max", (policy.max_mb * 1024 * 1024).to_string()),
@@ -542,6 +563,10 @@ mod tests {
         )
         .unwrap();
         std::fs::write(root.join("cgroup.subtree_control"), "").unwrap();
+        if memory {
+            // The service's own cap: a 6 GiB unit gives kids 3/4 = 4608 MiB.
+            std::fs::write(root.join("memory.max"), (6144u64 * 1024 * 1024).to_string()).unwrap();
+        }
         root
     }
 
@@ -581,7 +606,7 @@ mod tests {
             );
             // Per-class caps are the containment primitive: without them every
             // leaf inherits `max` and a build starves the plugin host.
-            let policy = ocserve_store::cgroup::leaf_policy(name);
+            let policy = ocserve_store::cgroup::leaf_policy_for(name, 4608);
             assert_eq!(
                 std::fs::read_to_string(leaf.join("memory.max")).unwrap(),
                 (policy.max_mb * 1024 * 1024).to_string(),
@@ -624,8 +649,8 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(root.join("kids/memory.high")).unwrap(),
-            (640u64 * 1024 * 1024).to_string(),
-            "kids must throttle before the hard cap"
+            (4032u64 * 1024 * 1024).to_string(),
+            "kids must throttle (7/8 of the 4608 MiB budget) before the hard cap"
         );
         // Aggregate must NOT carry oom.group: kids/ is a set of independent
         // services, so a build spiking must not take the browser host with it.
@@ -648,8 +673,8 @@ mod tests {
         assert_eq!(p, Partition::Ok);
         assert_eq!(
             std::fs::read_to_string(root.join("kids/memory.max")).unwrap(),
-            (700u64 * 1024 * 1024).to_string(),
-            "kids ceiling must be 700M in bytes (kernel takes plain bytes)"
+            (4608u64 * 1024 * 1024).to_string(),
+            "kids ceiling is 3/4 of the unit's 6 GiB memory.max, in bytes (kernel takes plain bytes)"
         );
         let sc = std::fs::read_to_string(root.join("cgroup.subtree_control")).unwrap();
         assert!(

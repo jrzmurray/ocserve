@@ -34,12 +34,14 @@ pub const LEAVES: [&str; 4] = ["plugin", "mcp", "tools", "pty"];
 /// - plugin: measured warm-up peak 260 MB (bundled embedding stack) + margin
 /// - mcp: live peak 122 MB + margin
 /// - pty: no measured spike, terminal buffers only
-/// - tools: the remainder of the aggregate `kids/` budget; a build may use it
-///   all, but cannot take the plugin's share with it.
+/// - tools: the remainder of the aggregate `kids/` budget, see [`leaf_policy_for`].
+///   A build may use all of it, but cannot take the plugin's share with it.
 ///
 /// `high` sits below `max` so the class is throttled (reclaim and slow) before
-/// the kernel kills it. The four `high` values sum to 960M, which is also the
-/// parent `MemoryHigh`, so normal concurrent peaks stay under the soft ceiling.
+/// the kernel kills it.
+///
+/// This is the fixed table for the three small classes and the 640M default for
+/// tools. Use [`leaf_policy_for`] when the kids budget is known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeafPolicy {
     pub high_mb: u64,
@@ -71,6 +73,114 @@ pub fn leaf_policy(name: &str) -> LeafPolicy {
             max_mb: 640,
             cpu_weight: 50,
         },
+    }
+}
+
+/// Leaf policy for a given aggregate `kids/` budget (MiB).
+///
+/// Only tools depends on the budget: it takes what the three small classes
+/// leave (`kids_mb - (plugin + mcp + pty) max`), never less than the 640M
+/// default. `high` keeps the same 7/10 ratio the default uses (448 of 640).
+pub fn leaf_policy_for(name: &str, kids_mb: u64) -> LeafPolicy {
+    if name != "tools" {
+        return leaf_policy(name);
+    }
+    let fixed: u64 = ["plugin", "mcp", "pty"]
+        .iter()
+        .map(|n| leaf_policy(n).max_mb)
+        .sum();
+    let max_mb = kids_mb
+        .saturating_sub(fixed)
+        .max(leaf_policy("tools").max_mb);
+    LeafPolicy {
+        high_mb: max_mb * 7 / 10,
+        max_mb,
+        cpu_weight: leaf_policy("tools").cpu_weight,
+    }
+}
+
+/// Aggregate `kids/` memory budget in MiB, and where it came from.
+///
+/// Derived from the service's own limit so it always fits under it, because the
+/// unit's `memory.max` caps the whole tree including kids:
+/// 1. `OCSERVE_KIDS_MEMORY_MAX_MB`, when set to a sane value (explicit wins);
+/// 2. 3/4 of the unit's `memory.max` (`unit_max_mb`), leaving main a quarter;
+/// 3. 1/2 of host memory (`host_mem_mb`), when the unit is uncapped;
+/// 4. 700 MiB, the old fixed default, when nothing can be read.
+pub fn kids_budget_mb(
+    env_override: Option<u64>,
+    unit_max_mb: Option<u64>,
+    host_mem_mb: Option<u64>,
+) -> (u64, &'static str) {
+    if let Some(v) = env_override.filter(|v| (32..=1_048_576).contains(v)) {
+        return (v, "env");
+    }
+    if let Some(u) = unit_max_mb {
+        return ((u * 3 / 4).max(256), "unit-memory-max");
+    }
+    if let Some(h) = host_mem_mb {
+        return ((h / 2).max(256), "host-memory");
+    }
+    (700, "default")
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_env_wins_over_everything() {
+        assert_eq!(
+            kids_budget_mb(Some(2048), Some(6144), Some(12000)),
+            (2048, "env")
+        );
+    }
+
+    #[test]
+    fn out_of_range_env_is_ignored() {
+        assert_eq!(
+            kids_budget_mb(Some(5), Some(6144), None),
+            (4608, "unit-memory-max")
+        );
+    }
+
+    #[test]
+    fn three_quarters_of_the_unit_cap() {
+        // ideapad5 unit MemoryMax 6 GiB -> 4.5 GiB for kids, 1.5 GiB left for main.
+        assert_eq!(
+            kids_budget_mb(None, Some(6144), Some(12000)),
+            (4608, "unit-memory-max")
+        );
+    }
+
+    #[test]
+    fn uncapped_unit_falls_back_to_half_host_memory() {
+        assert_eq!(
+            kids_budget_mb(None, None, Some(12000)),
+            (6000, "host-memory")
+        );
+    }
+
+    #[test]
+    fn nothing_readable_keeps_the_old_default() {
+        assert_eq!(kids_budget_mb(None, None, None), (700, "default"));
+    }
+
+    #[test]
+    fn tools_takes_the_remainder_and_keeps_the_floor() {
+        // Default budget: remainder is below the floor, so tools stays at 640.
+        let t = leaf_policy_for("tools", 700);
+        assert_eq!((t.max_mb, t.high_mb), (640, 448));
+        // 4.5 GiB budget: tools gets 4608 - 608 = 4000, high 7/10 of that.
+        let t = leaf_policy_for("tools", 4608);
+        assert_eq!((t.max_mb, t.high_mb), (4000, 2800));
+        assert!(t.high_mb < t.max_mb);
+    }
+
+    #[test]
+    fn small_classes_do_not_depend_on_the_budget() {
+        assert_eq!(leaf_policy_for("plugin", 4608), leaf_policy("plugin"));
+        assert_eq!(leaf_policy_for("mcp", 700), leaf_policy("mcp"));
     }
 }
 

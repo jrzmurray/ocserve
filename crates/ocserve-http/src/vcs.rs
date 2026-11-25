@@ -66,6 +66,101 @@ fn run_git(dir: &str, args: &[&str]) -> Option<(String, i32)> {
     Some((text, out.status.code().unwrap_or(-1)))
 }
 
+/// Run a git command that changes the worktree list and report the outcome.
+///
+/// `run_git` cannot tell a killed process from a failed one: a process killed
+/// by a signal has no exit code, so it became `-1` and its stdout was reported
+/// as the error. Git writes its errors to stderr, so that stdout was empty or
+/// only progress lines. This keeps stderr, and names the signal when git was
+/// killed (the kernel OOM killer sends SIGKILL).
+fn run_git_checked(dir: &str, args: &[&str]) -> Result<(), String> {
+    let out = ocserve_store::cgroup::command("git", "tools")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .map_err(|e| format!("git failed to spawn: {e}"))?;
+    let verb = args.first().copied().unwrap_or("git");
+    git_result(verb, &out.status, &out.stdout, &out.stderr)
+}
+
+#[cfg(unix)]
+fn signal_of(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn signal_of(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
+/// Pure mapping from a finished git process to the `worktree` result.
+fn git_result(
+    verb: &str,
+    status: &std::process::ExitStatus,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<(), String> {
+    if status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(stderr).trim().to_string();
+    let out = String::from_utf8_lossy(stdout).trim().to_string();
+    let detail = if err.is_empty() { out } else { err };
+    match status.code() {
+        Some(code) if detail.is_empty() => Err(format!("git {verb} exited with status {code}")),
+        Some(_) => Err(detail),
+        None => {
+            let sig = signal_of(status).map_or_else(|| "?".to_string(), |s| s.to_string());
+            let said = if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" git said: {detail}")
+            };
+            Err(format!(
+                "git {verb} was killed by signal {sig} before it finished. Inside a \
+                 memory-limited cgroup SIGKILL is usually the memory limit (see \
+                 kids/tools/memory.events).{said}"
+            ))
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod git_result_tests {
+    use super::git_result;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    #[test]
+    fn success_is_ok() {
+        assert!(git_result("add", &ExitStatus::from_raw(0), b"", b"").is_ok());
+    }
+
+    #[test]
+    fn stderr_is_the_error_not_stdout() {
+        let st = ExitStatus::from_raw(128 << 8);
+        let e = git_result("add", &st, b"", b"fatal: '/x' already exists").unwrap_err();
+        assert_eq!(e, "fatal: '/x' already exists");
+    }
+
+    #[test]
+    fn plain_failure_without_output_names_the_status() {
+        let st = ExitStatus::from_raw(1 << 8);
+        let e = git_result("remove", &st, b"", b"").unwrap_err();
+        assert_eq!(e, "git remove exited with status 1");
+    }
+
+    #[test]
+    fn sigkill_is_reported_as_a_kill_not_an_empty_error() {
+        let st = ExitStatus::from_raw(9);
+        let e = git_result("add", &st, b"Updating files: 40%", b"").unwrap_err();
+        assert!(e.contains("killed by signal 9"), "{e}");
+        assert!(e.contains("memory"), "{e}");
+        assert!(e.contains("Updating files: 40%"), "{e}");
+    }
+}
+
 /// `git status --porcelain=v1 -z --untracked-files=all --no-renames`.
 /// Returns (file, code2) where code2 is the two-char XY.
 fn status_entries(dir: &str) -> Vec<(String, String)> {
@@ -324,11 +419,7 @@ pub fn worktree_add(dir: &str, path: &str, branch: Option<&str>) -> Result<Strin
     if let Some(b) = branch {
         args.push(b);
     }
-    match run_git(dir, &args) {
-        Some((_, 0)) => Ok(path.to_string()),
-        Some((t, _)) => Err(t.trim().to_string()),
-        None => Err("git failed to spawn".to_string()),
-    }
+    run_git_checked(dir, &args).map(|()| path.to_string())
 }
 
 /// Remove a worktree (`git worktree remove [--force] <dir>`).
@@ -342,11 +433,7 @@ pub fn worktree_remove(dir: &str, path: &str, force: bool) -> Result<(), String>
     }
     args.push("--");
     args.push(path);
-    match run_git(dir, &args) {
-        Some((_, 0)) => Ok(()),
-        Some((t, _)) => Err(t.trim().to_string()),
-        None => Err("git failed to spawn".to_string()),
-    }
+    run_git_checked(dir, &args)
 }
 
 pub fn status(dir: &str) -> Value {
